@@ -1,0 +1,171 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel CalculateNormals
+#pragma kernel CalculateWatershed
+
+
+struct TerrainCell
+{
+	float height;
+	float3 normal;
+	float waterDepth;
+	float debug;
+	// -1/2 index in x direction for pressure.
+	//float ux;
+	// -1/2 index in y direction for pressure.
+	//float uy;
+/*	float3 velocity;
+	float sediment;*/
+};
+
+#include "Erosion.cginc"
+#include "SimplexNoise.cginc"
+
+// two buffers that will be swapped back and forth as processing occurs.
+RWStructuredBuffer<TerrainCell> working1;
+RWStructuredBuffer<TerrainCell> working2;
+uint width;
+float cellWidth;
+
+float rainMetersPerSecond;
+float stepDuration;
+float waterLoss;
+
+float amplitude1;
+float frequency1;
+float offset1;
+float amplitude2;
+float frequency2;
+float offset2;
+
+float elevate;
+float dropOffDistance;
+float inflectionPoint;
+float steepness;
+
+float2 flatArea;
+float flatElevation; 
+float flatSize;
+float flatWeight;
+
+float Flatten(float2 p, float elevation);
+float Sigmoid(float2 p, float inflect, float steep);
+
+[numthreads(16,1,1)] 
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+	float2 pos1;
+	float2 pos2;
+	float2 pos = { (id.x % width) / (float)width, (id.x / width) / (float)width };
+
+	pos1.x = pos.x * frequency1 + offset1;
+	pos1.y = pos.y * frequency1 + offset1;
+
+	pos2.x = pos.x * frequency2 + offset2;
+	pos2.y = pos.y * frequency2 + offset2;
+
+	float noise1 = ((snoise(pos1) + 1) / 2) * amplitude1;
+	float noise2 = ((snoise(pos2) + 1) / 2) * amplitude2;
+
+	// rescale pos to -1, -1
+	float2 p;
+	p.x = pos.x * 2 - 1;
+	p.y = pos.y * 2 - 1;
+	float dropOff = (1 - Sigmoid(p, inflectionPoint, steepness));
+	dropOff = 0;
+
+	float elevation = noise1 + noise2 - dropOff + elevate;
+
+	elevation = Flatten(pos, elevation);
+
+    working1[id.x].height = clamp(elevation, 0, 1);
+	//working1[id.x].height = pos.x;
+}
+
+[numthreads(16,1,1)]
+void CalculateNormals(uint3 id : SV_DispatchThreadID)
+{
+	int2 pos;
+	pos.x = id.x % width;
+	pos.y = id.x / width;
+
+	working2[id.x + id.y * width].normal = CalculateHornNormal(working1, pos, width, cellWidth);
+}
+
+[numthreads(16,1,1)]
+void CalculateWatershed(uint3 id : SV_DispatchThreadID)
+{
+	int2 pos = {(uint)id.x % width, id.x / width};
+
+	float depth = working1[id.x].waterDepth;
+	depth = max(depth - 0.0001, 0);
+
+	float3 normal = CalculateWaterHornNormal(working1, pos, width, cellWidth);
+	float outgoing = (depth * (1 - normal.y / (normal.x + normal.y + normal.z)) + waterLoss) *
+		stepDuration;
+
+	working2[id.x].height = working1[id.x].height;
+
+	float incoming = rainMetersPerSecond;
+	//incoming += CalculateWaterContribution(working1, int2(pos.x - 1, pos.y - 1), pos, width, cellWidth);
+	incoming += CalculateWaterContribution(working1, int2(pos.x - 1, pos.y + 0), pos, width, cellWidth);
+	//incoming += CalculateWaterContribution(working1, int2(pos.x - 1, pos.y + 1), pos, width, cellWidth);
+	incoming += CalculateWaterContribution(working1, int2(pos.x + 0, pos.y - 1), pos, width, cellWidth);
+	incoming += CalculateWaterContribution(working1, int2(pos.x + 0, pos.y + 1), pos, width, cellWidth);
+	//incoming += CalculateWaterContribution(working1, int2(pos.x + 1, pos.y - 1), pos, width, cellWidth);
+	incoming += CalculateWaterContribution(working1, int2(pos.x + 1, pos.y + 0), pos, width, cellWidth);
+	//incoming += CalculateWaterContribution(working1, int2(pos.x + 1, pos.y + 1), pos, width, cellWidth);
+	incoming *= stepDuration;
+	
+	working2[id.x].waterDepth = max(0, depth + incoming - outgoing);
+
+	//working2[id.x].waterDepth = CalculateWaterContribution(working1, int2(pos.x - 1, pos.y + 0), pos, width, cellWidth);
+
+	working2[id.x].debug = normal.y;
+}
+
+
+/// Flatten flattens a point p. This is useful when creating predefined regions for towns.
+///
+/// flatArea - The center of the flattening operation.
+/// flatElevation - The goal elevation when flattening a region.
+/// flatSize - The radius of the area to flatten. Outside of this radius may still be flattened a
+///   bit, but it the radius is the most effected area.
+/// flatWeight - The amount of flattening to perform. 0 is no flattening. 1 will ensure p is exactly
+///   at the desired elevation.
+float Flatten(float2 p, float elevation)
+{
+	float2 diff;
+	diff.x = (p.x - flatArea.x) / flatSize;
+	diff.y = (p.y - flatArea.y) / flatSize;
+
+	float g = Sigmoid(diff, 0.7, 5) * flatWeight;
+
+	return (elevation * (1 - g) + flatElevation * g);
+	//return flatElevation * g;
+}
+
+float Sigmoid(float2 p, float inflect, float steep)
+{
+    float dist = sqrt(p.x * p.x + p.y * p.y);
+    // The middle of the drop off in units of distance (0 is the center, 1 is the edge)
+    // The higher this value the faster the drop-off.
+    float v = (dist - inflect) * steep;
+
+    float maxEv = exp(-inflect * steep);
+    float maxG = (1 - maxEv / (maxEv + 1)) / 2;
+
+    // sigmoid function
+    float ev = exp(v);
+    float g = (1 - ev / (ev + 1)) / 2;
+
+    // cause a quick drop off to zero past a distance of .9
+    if (dist > 0.9f)
+    {
+        g = g * (1 - (dist - .9) / 0.1);
+    }
+
+    // scale from 0 - 1 
+    return g / maxG;
+}
+
